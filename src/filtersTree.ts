@@ -1,7 +1,7 @@
 // src/filtersTree.ts
 
 import * as vscode from 'vscode';
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 
@@ -9,19 +9,55 @@ import * as fs from 'fs/promises';
  * The TreeDataProvider that builds a separate "VS Filters" view per workspace folder.
  * In a multi-root workspace, each folder's .vcxproj.filters tree appears as its own branch.
  */
-export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem> {
+export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem>, vscode.TreeDragAndDropController<TreeItem> {
+  public readonly dragMimeTypes = ['application/vnd.code.tree.vsfilters'];
+  public readonly dropMimeTypes = ['application/vnd.code.tree.vsfilters'];
   private _onDidChangeTreeData = new vscode.EventEmitter<TreeItem | undefined>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   /** Cache: for each workspace folder path (fsPath), store its root FolderNode. */
   private trees = new Map<string, FolderNode>();
 
+  /** File watchers for cleanup */
+  private watchers: vscode.Disposable[] = [];
+
   constructor() {
-    // (Optional) Watch for any .vcxproj.filters file changes and auto-refresh:
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*.vcxproj.filters');
-    watcher.onDidChange(() => this.refresh());
-    watcher.onDidCreate(() => this.refresh());
-    watcher.onDidDelete(() => this.refresh());
+    // Watch for any .vcxproj.filters file changes and auto-refresh:
+    const filtersWatcher = vscode.workspace.createFileSystemWatcher('**/*.vcxproj.filters');
+    filtersWatcher.onDidChange(() => this.refresh());
+    filtersWatcher.onDidCreate(() => this.refresh());
+    filtersWatcher.onDidDelete(() => this.refresh());
+    this.watchers.push(filtersWatcher);
+
+    // Watch for file changes in the workspace (excluding directories handled by findFiles exclude pattern)
+    const filesWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+    filesWatcher.onDidCreate((uri) => {
+      // Skip files in excluded directories
+      const relativePath = vscode.workspace.asRelativePath(uri);
+      if (!this.shouldExcludeFile(relativePath)) {
+        // Debounce rapid file changes
+        setTimeout(() => this.refresh(), 100);
+      }
+    });
+    filesWatcher.onDidDelete((uri) => {
+      const relativePath = vscode.workspace.asRelativePath(uri);
+      if (!this.shouldExcludeFile(relativePath)) {
+        setTimeout(() => this.refresh(), 100);
+      }
+    });
+    this.watchers.push(filesWatcher);
+    
+    // Watch for file renames/moves
+    const workspaceWatcher = vscode.workspace.onDidRenameFiles(() => {
+      setTimeout(() => this.refresh(), 100);
+    });
+    this.watchers.push(workspaceWatcher);
+  }
+
+  /** Clean up resources */
+  dispose(): void {
+    this.watchers.forEach(watcher => watcher.dispose());
+    this._onDidChangeTreeData.dispose();
   }
 
   /** Called when the user triggers "Refresh VS Filters" */
@@ -52,7 +88,7 @@ export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem
           return this.trees.get(wf.uri.fsPath)!;
         }
         // Otherwise, create a new "stub" root node; children populated when expanded.
-        const root = new FolderNode(wf.uri, path.basename(wf.uri.fsPath));
+        const root = new FolderNode(wf.uri, path.basename(wf.uri.fsPath), true);
         this.trees.set(wf.uri.fsPath, root);
         return root;
       });
@@ -95,6 +131,125 @@ export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem
   }
 
   // ----------------------------------------------------------------------------
+  // DRAG AND DROP SUPPORT
+  // ----------------------------------------------------------------------------
+
+  async handleDrag(source: TreeItem[], dataTransfer: vscode.DataTransfer): Promise<void> {
+    const dragData = source.map(item => ({
+      uri: item instanceof FileNode || item instanceof FolderNode ? item.uri.toString() : '',
+      type: item instanceof FileNode ? 'file' : 'folder',
+      label: typeof item.label === 'string' ? item.label : (item.label?.label || '')
+    }));
+    
+    dataTransfer.set('application/vnd.code.tree.vsfilters', new vscode.DataTransferItem(JSON.stringify(dragData)));
+  }
+
+  async handleDrop(target: TreeItem | undefined, dataTransfer: vscode.DataTransfer): Promise<void> {
+    const transferItem = dataTransfer.get('application/vnd.code.tree.vsfilters');
+    if (!transferItem) {
+      return;
+    }
+
+    const dragData = JSON.parse(transferItem.value);
+    if (!Array.isArray(dragData)) {
+      return;
+    }
+
+    // Only allow dropping on FolderNodes
+    if (!(target instanceof FolderNode)) {
+      return;
+    }
+
+    for (const item of dragData) {
+      if (item.type === 'file') {
+        const fileUri = vscode.Uri.parse(item.uri);
+        await this.moveFileToFilter(fileUri, target);
+      } else if (item.type === 'folder') {
+        const folderUri = vscode.Uri.parse(item.uri);
+        await this.moveFilterToParent(folderUri, target);
+      }
+    }
+
+    // Refresh the tree to show changes
+    this.refresh();
+  }
+
+  // ----------------------------------------------------------------------------
+  // FILTER MANAGEMENT METHODS
+  // ----------------------------------------------------------------------------
+
+  async createFilter(parentFolder: FolderNode, filterName: string): Promise<void> {
+    try {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(parentFolder.uri);
+      if (!workspaceFolder) {
+        throw new Error('Could not find workspace folder');
+      }
+
+      let filtersPath = await findFiltersFile(workspaceFolder.uri);
+      if (!filtersPath) {
+        // Create a new .vcxproj.filters file if one doesn't exist
+        const projectName = path.basename(workspaceFolder.uri.fsPath);
+        filtersPath = vscode.Uri.joinPath(workspaceFolder.uri, `${projectName}.vcxproj.filters`);
+        await this.createNewFiltersFile(filtersPath);
+        vscode.window.showInformationMessage(`Created new .vcxproj.filters file: ${path.basename(filtersPath.fsPath)}`);
+      }
+
+      // Create the new filter path
+      const parentPath = this.getFilterPath(parentFolder, workspaceFolder.uri);
+      const newFilterPath = parentPath ? `${parentPath}\\${filterName}` : filterName;
+
+      // Add the filter to the XML (even if empty, we need to ensure it exists in structure)
+      await this.addFilterToXML(filtersPath, newFilterPath);
+
+      // Refresh the tree
+      this.refresh();
+      
+      vscode.window.showInformationMessage(`Filter "${filterName}" created successfully`);
+    } catch (error) {
+      vscode.window.showErrorMessage(`Failed to create filter: ${error}`);
+    }
+  }
+
+  async deleteFilter(folderNode: FolderNode): Promise<void> {
+    try {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderNode.uri);
+      if (!workspaceFolder) {
+        throw new Error('Could not find workspace folder');
+      }
+
+      const filtersPath = await findFiltersFile(workspaceFolder.uri);
+      if (!filtersPath) {
+        throw new Error('No .vcxproj.filters file found');
+      }
+
+      const filterPath = this.getFilterPath(folderNode, workspaceFolder.uri);
+      if (!filterPath) {
+        throw new Error('Cannot delete root folder');
+      }
+
+      // Confirm deletion
+      const result = await vscode.window.showWarningMessage(
+        `Are you sure you want to delete the filter "${filterPath}" and all sub-filters?`,
+        'Yes', 'No'
+      );
+
+      if (result !== 'Yes') {
+        return;
+      }
+
+      // Remove from XML
+      await this.removeFilterFromXML(filtersPath, filterPath);
+
+      // Refresh the tree
+      this.refresh();
+
+      vscode.window.showInformationMessage(`Filter "${filterPath}" deleted successfully`);
+    } catch (error) {
+      vscode.window.showErrorMessage(`Failed to delete filter: ${error}`);
+    }
+  }
+
+  // ----------------------------------------------------------------------------
   // PRIVATE HELPERS BELOW
   // ----------------------------------------------------------------------------
 
@@ -124,7 +279,7 @@ export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem
   private async buildTree(folderUri: vscode.Uri): Promise<FolderNode> {
     const filtersPath = await findFiltersFile(folderUri);
     // Create a "virtual root" node representing the workspace folder.
-    const root = new FolderNode(folderUri, path.basename(folderUri.fsPath));
+    const root = new FolderNode(folderUri, path.basename(folderUri.fsPath), true);
     root.populated = true;
 
     if (!filtersPath) {
@@ -199,13 +354,58 @@ export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem
       return folderNode;
     };
 
+    // First, create all filter definitions (even empty ones)
+    if (data.Project && data.Project.ItemGroup) {
+      const groups = Array.isArray(data.Project.ItemGroup)
+        ? data.Project.ItemGroup
+        : [data.Project.ItemGroup];
+
+      for (const group of groups) {
+        if (group.Filter) {
+          const filters = Array.isArray(group.Filter) ? group.Filter : [group.Filter];
+          for (const filterDef of filters) {
+            const filterPath = filterDef['@_Include'];
+            if (filterPath) {
+              ensureNode(filterPath);
+            }
+          }
+        }
+      }
+    }
+
+    // Keep track of files that are assigned to filters
+    const filteredFiles = new Set<string>();
+
+    // Then, add files to their respective filters (only if they exist)
     for (const { include, filter } of items) {
       const parentNode = ensureNode(filter);
       // Resolve the actual file's Uri relative to the workspace folder.
       const fileUri = vscode.Uri.joinPath(folderUri, include.replace(/\\/g, '/'));
-      // Create a leaf FileNode
-      parentNode.children.push(new FileNode(fileUri));
+      
+      try {
+        // Check if the file actually exists before adding it to the tree
+        const stat = await vscode.workspace.fs.stat(fileUri);
+        if (stat.type === vscode.FileType.File) {
+          // Create a leaf FileNode only if file exists
+          parentNode.children.push(new FileNode(fileUri));
+        }
+      } catch (error) {
+        // File doesn't exist - skip it but don't show error
+        // This is normal when files have been deleted but XML hasn't been updated
+        continue;
+      }
+      
+      // Track this file as being filtered (even if it doesn't exist, for unfiltered detection)
+      filteredFiles.add(include.replace(/\\/g, '/'));
     }
+
+    // Clean up stale file references in the XML
+    if (filtersPath) {
+      await this.cleanupStaleFileReferences(filtersPath, folderUri);
+    }
+
+    // Find all files in the workspace and add unfiltered ones to the root
+    await this.addUnfilteredFilesToRoot(folderUri, root, filteredFiles);
 
     const sortNodeRecursively = (node: FolderNode) => {
       this.sortChildren(node.children);
@@ -219,6 +419,519 @@ export class FiltersTreeDataProvider implements vscode.TreeDataProvider<TreeItem
 
     return root;
   }
+
+  /**
+   * Get the filter path for a given FolderNode relative to the workspace root
+   */
+  private getFilterPath(folderNode: FolderNode, workspaceUri: vscode.Uri): string {
+    if (folderNode.uri.fsPath === workspaceUri.fsPath) {
+      return ''; // This is the workspace root
+    }
+    
+    // For filter nodes, extract the path from the URI
+    const relativePath = path.relative(workspaceUri.fsPath, folderNode.uri.fsPath);
+    return relativePath.replace(/\//g, '\\');
+  }
+
+  /**
+   * Move a file to a different filter
+   */
+  private async moveFileToFilter(fileUri: vscode.Uri, targetFolder: FolderNode): Promise<void> {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(fileUri);
+    if (!workspaceFolder) {
+      throw new Error('Could not find workspace folder for file');
+    }
+
+    let filtersPath = await findFiltersFile(workspaceFolder.uri);
+    if (!filtersPath) {
+      // Create a new .vcxproj.filters file if one doesn't exist
+      const projectName = path.basename(workspaceFolder.uri.fsPath);
+      filtersPath = vscode.Uri.joinPath(workspaceFolder.uri, `${projectName}.vcxproj.filters`);
+      await this.createNewFiltersFile(filtersPath);
+      vscode.window.showInformationMessage(`Created new .vcxproj.filters file: ${path.basename(filtersPath.fsPath)}`);
+    }
+
+    const targetFilterPath = this.getFilterPath(targetFolder, workspaceFolder.uri);
+    const relativePath = path.relative(workspaceFolder.uri.fsPath, fileUri.fsPath).replace(/\//g, '\\');
+
+    await this.updateFileFilterInXML(filtersPath, relativePath, targetFilterPath);
+  }
+
+  /**
+   * Move a filter to a different parent filter
+   */
+  private async moveFilterToParent(sourceFilterUri: vscode.Uri, targetParentFolder: FolderNode): Promise<void> {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(sourceFilterUri);
+    if (!workspaceFolder) {
+      throw new Error('Could not find workspace folder for filter');
+    }
+
+    const filtersPath = await findFiltersFile(workspaceFolder.uri);
+    if (!filtersPath) {
+      throw new Error('No .vcxproj.filters file found');
+    }
+
+    const sourceFilterPath = this.getFilterPath({ uri: sourceFilterUri } as FolderNode, workspaceFolder.uri);
+    const targetParentPath = this.getFilterPath(targetParentFolder, workspaceFolder.uri);
+    
+    // Can't move a filter into itself or its descendants
+    if (targetParentPath.startsWith(sourceFilterPath)) {
+      vscode.window.showErrorMessage('Cannot move a filter into itself or its descendants');
+      return;
+    }
+
+    // Can't move workspace root
+    if (!sourceFilterPath) {
+      vscode.window.showErrorMessage('Cannot move the workspace root folder');
+      return;
+    }
+
+    // Extract the filter name (last part after the last backslash)
+    const filterName = sourceFilterPath.split('\\').pop() || sourceFilterPath;
+    const newFilterPath = targetParentPath ? `${targetParentPath}\\${filterName}` : filterName;
+
+    try {
+      await this.moveFilterInXML(filtersPath, sourceFilterPath, newFilterPath);
+      vscode.window.showInformationMessage(`Filter "${sourceFilterPath}" moved to "${newFilterPath}"`);
+    } catch (error) {
+      vscode.window.showErrorMessage(`Failed to move filter: ${error}`);
+    }
+  }
+
+  /**
+   * Add a new filter to the XML file structure
+   */
+  private async addFilterToXML(filtersPath: vscode.Uri, filterPath: string): Promise<void> {
+    const xml = await fs.readFile(filtersPath.fsPath, 'utf-8');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const data = parser.parse(xml);
+
+    // Ensure we have the Project structure
+    if (!data.Project) {
+      data.Project = {};
+    }
+
+    // Ensure we have ItemGroup for filters
+    if (!data.Project.ItemGroup) {
+      data.Project.ItemGroup = [];
+    }
+
+    // Convert to array if it's not already
+    if (!Array.isArray(data.Project.ItemGroup)) {
+      data.Project.ItemGroup = [data.Project.ItemGroup];
+    }
+
+    // Find or create the Filter ItemGroup
+    let filterGroup = data.Project.ItemGroup.find((group: any) => group.Filter);
+    if (!filterGroup) {
+      filterGroup = { Filter: [] };
+      data.Project.ItemGroup.push(filterGroup);
+    }
+
+    // Ensure Filter is an array
+    if (!Array.isArray(filterGroup.Filter)) {
+      filterGroup.Filter = filterGroup.Filter ? [filterGroup.Filter] : [];
+    }
+
+    // Check if filter already exists
+    const existingFilter = filterGroup.Filter.find((f: any) => f['@_Include'] === filterPath);
+    if (!existingFilter) {
+      // Add the new filter
+      filterGroup.Filter.push({
+        '@_Include': filterPath,
+        UniqueIdentifier: `{${this.generateGuid()}}`
+      });
+    }
+
+    // Write back to file
+    const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_', format: true });
+    const xmlOutput = builder.build(data);
+    await fs.writeFile(filtersPath.fsPath, xmlOutput, 'utf-8');
+  }
+
+  /**
+   * Remove a filter and all its contents from the XML file
+   */
+  private async removeFilterFromXML(filtersPath: vscode.Uri, filterPath: string): Promise<void> {
+    const xml = await fs.readFile(filtersPath.fsPath, 'utf-8');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const data = parser.parse(xml);
+
+    if (!data.Project || !data.Project.ItemGroup) {
+      return;
+    }
+
+    const groups = Array.isArray(data.Project.ItemGroup) ? data.Project.ItemGroup : [data.Project.ItemGroup];
+
+    for (const group of groups) {
+      // Remove filter definition
+      if (group.Filter) {
+        const filters = Array.isArray(group.Filter) ? group.Filter : [group.Filter];
+        group.Filter = filters.filter((f: any) => !f['@_Include']?.startsWith(filterPath));
+        if (group.Filter.length === 0) {
+          delete group.Filter;
+        } else if (group.Filter.length === 1 && Array.isArray(group.Filter)) {
+          group.Filter = group.Filter[0];
+        }
+      }
+
+      // Remove files in this filter and sub-filters
+      for (const tag of Object.keys(group)) {
+        if (tag !== 'Filter' && group[tag]) {
+          const items = Array.isArray(group[tag]) ? group[tag] : [group[tag]];
+          group[tag] = items.filter((item: any) => {
+            const filter = item.Filter;
+            if (!filter) return true;
+            const filterString = Array.isArray(filter) ? filter[filter.length - 1] : filter;
+            return !filterString.startsWith(filterPath);
+          });
+          
+          if (group[tag].length === 0) {
+            delete group[tag];
+          } else if (group[tag].length === 1 && Array.isArray(group[tag])) {
+            group[tag] = group[tag][0];
+          }
+        }
+      }
+    }
+
+    // Clean up empty ItemGroups
+    data.Project.ItemGroup = groups.filter((group: any) => Object.keys(group).length > 0);
+    if (data.Project.ItemGroup.length === 0) {
+      delete data.Project.ItemGroup;
+    } else if (data.Project.ItemGroup.length === 1 && Array.isArray(data.Project.ItemGroup)) {
+      data.Project.ItemGroup = data.Project.ItemGroup[0];
+    }
+
+    // Write back to file
+    const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_', format: true });
+    const xmlOutput = builder.build(data);
+    await fs.writeFile(filtersPath.fsPath, xmlOutput, 'utf-8');
+  }
+
+  /**
+   * Update the filter assignment for a specific file
+   */
+  private async updateFileFilterInXML(filtersPath: vscode.Uri, filePath: string, newFilterPath: string): Promise<void> {
+    const xml = await fs.readFile(filtersPath.fsPath, 'utf-8');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const data = parser.parse(xml);
+
+    // Ensure basic structure exists
+    if (!data.Project) {
+      data.Project = {};
+    }
+    if (!data.Project.ItemGroup) {
+      data.Project.ItemGroup = [];
+    }
+
+    const groups = Array.isArray(data.Project.ItemGroup) ? data.Project.ItemGroup : [data.Project.ItemGroup];
+    let fileFound = false;
+
+    // Find and update the file entry
+    for (const group of groups) {
+      for (const tag of Object.keys(group)) {
+        if (tag !== 'Filter') {
+          const items = Array.isArray(group[tag]) ? group[tag] : [group[tag]];
+          for (const item of items) {
+            if (item['@_Include'] === filePath) {
+              fileFound = true;
+              if (newFilterPath) {
+                item.Filter = newFilterPath;
+              } else {
+                delete item.Filter;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // If file not found, add it to an appropriate ItemGroup
+    if (!fileFound) {
+      // Determine the file type based on extension
+      const extension = path.extname(filePath).toLowerCase();
+      let itemType = 'ClInclude'; // Default to header
+      
+      if (['.cpp', '.c', '.cc', '.cxx'].includes(extension)) {
+        itemType = 'ClCompile';
+      } else if (['.rc', '.rc2'].includes(extension)) {
+        itemType = 'ResourceCompile';
+      } else if (['.txt', '.md', '.xml', '.json'].includes(extension)) {
+        itemType = 'Text';
+      }
+
+      // Find or create appropriate ItemGroup
+      let targetGroup = groups.find((group: any) => group[itemType]);
+      if (!targetGroup) {
+        targetGroup = {};
+        groups.push(targetGroup);
+      }
+
+      // Add the file entry
+      const newItem: any = { '@_Include': filePath };
+      if (newFilterPath) {
+        newItem.Filter = newFilterPath;
+      }
+
+      if (!targetGroup[itemType]) {
+        targetGroup[itemType] = newItem;
+      } else if (Array.isArray(targetGroup[itemType])) {
+        targetGroup[itemType].push(newItem);
+      } else {
+        targetGroup[itemType] = [targetGroup[itemType], newItem];
+      }
+
+      // Update the data structure
+      if (groups.length === 1) {
+        data.Project.ItemGroup = groups[0];
+      } else {
+        data.Project.ItemGroup = groups;
+      }
+    }
+
+    // Write back to file
+    const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_', format: true });
+    const xmlOutput = builder.build(data);
+    await fs.writeFile(filtersPath.fsPath, xmlOutput, 'utf-8');
+  }
+
+  /**
+   * Move a filter and all its sub-filters and files in the XML
+   */
+  private async moveFilterInXML(filtersPath: vscode.Uri, oldFilterPath: string, newFilterPath: string): Promise<void> {
+    const xml = await fs.readFile(filtersPath.fsPath, 'utf-8');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const data = parser.parse(xml);
+
+    if (!data.Project || !data.Project.ItemGroup) {
+      return;
+    }
+
+    const groups = Array.isArray(data.Project.ItemGroup) ? data.Project.ItemGroup : [data.Project.ItemGroup];
+
+    for (const group of groups) {
+      // Update filter definitions
+      if (group.Filter) {
+        const filters = Array.isArray(group.Filter) ? group.Filter : [group.Filter];
+        for (const filter of filters) {
+          const filterInclude = filter['@_Include'];
+          if (filterInclude === oldFilterPath) {
+            // Exact match - rename this filter
+            filter['@_Include'] = newFilterPath;
+          } else if (filterInclude && filterInclude.startsWith(oldFilterPath + '\\')) {
+            // Sub-filter - update its path
+            const relativePath = filterInclude.substring(oldFilterPath.length + 1);
+            filter['@_Include'] = `${newFilterPath}\\${relativePath}`;
+          }
+        }
+      }
+
+      // Update file references to filters
+      for (const tag of Object.keys(group)) {
+        if (tag !== 'Filter' && group[tag]) {
+          const items = Array.isArray(group[tag]) ? group[tag] : [group[tag]];
+          for (const item of items) {
+            if (item.Filter) {
+              const filterValue = Array.isArray(item.Filter) ? item.Filter[item.Filter.length - 1] : item.Filter;
+              if (filterValue === oldFilterPath) {
+                // Exact match - update file's filter reference
+                item.Filter = newFilterPath;
+              } else if (filterValue && filterValue.startsWith(oldFilterPath + '\\')) {
+                // File in sub-filter - update its filter reference
+                const relativePath = filterValue.substring(oldFilterPath.length + 1);
+                item.Filter = `${newFilterPath}\\${relativePath}`;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Write back to file
+    const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_', format: true });
+    const xmlOutput = builder.build(data);
+    await fs.writeFile(filtersPath.fsPath, xmlOutput, 'utf-8');
+  }
+
+  /**
+   * Generate a GUID for new filters
+   */
+  private generateGuid(): string {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  /**
+   * Remove non-existent files from the XML file
+   */
+  private async cleanupStaleFileReferences(filtersPath: vscode.Uri, folderUri: vscode.Uri): Promise<void> {
+    const xml = await fs.readFile(filtersPath.fsPath, 'utf-8');
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const data = parser.parse(xml);
+
+    if (!data.Project || !data.Project.ItemGroup) {
+      return;
+    }
+
+    const groups = Array.isArray(data.Project.ItemGroup) ? data.Project.ItemGroup : [data.Project.ItemGroup];
+    let hasChanges = false;
+
+    for (const group of groups) {
+      for (const tag of Object.keys(group)) {
+        if (tag !== 'Filter' && group[tag]) {
+          const items = Array.isArray(group[tag]) ? group[tag] : [group[tag]];
+          const validItems = [];
+
+          for (const item of items) {
+            const includePath = item['@_Include'];
+            if (includePath) {
+              const fileUri = vscode.Uri.joinPath(folderUri, includePath.replace(/\\/g, '/'));
+              try {
+                const stat = await vscode.workspace.fs.stat(fileUri);
+                if (stat.type === vscode.FileType.File) {
+                  validItems.push(item);
+                } else {
+                  hasChanges = true; // File doesn't exist, will be removed
+                }
+              } catch (error) {
+                hasChanges = true; // File doesn't exist, will be removed
+              }
+            } else {
+              validItems.push(item); // Keep items without Include attribute
+            }
+          }
+
+          if (validItems.length === 0) {
+            delete group[tag];
+          } else if (validItems.length === 1) {
+            group[tag] = validItems[0];
+          } else {
+            group[tag] = validItems;
+          }
+        }
+      }
+    }
+
+    // Only write back if we made changes
+    if (hasChanges) {
+      // Clean up empty ItemGroups
+      data.Project.ItemGroup = groups.filter((group: any) => Object.keys(group).length > 0);
+      if (data.Project.ItemGroup.length === 0) {
+        delete data.Project.ItemGroup;
+      } else if (data.Project.ItemGroup.length === 1 && Array.isArray(data.Project.ItemGroup)) {
+        data.Project.ItemGroup = data.Project.ItemGroup[0];
+      }
+
+      const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_', format: true });
+      const xmlOutput = builder.build(data);
+      await fs.writeFile(filtersPath.fsPath, xmlOutput, 'utf-8');
+    }
+  }
+
+  /**
+   * Create a new .vcxproj.filters file with basic structure
+   */
+  private async createNewFiltersFile(filtersPath: vscode.Uri): Promise<void> {
+    const basicFiltersXml = `<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+  </ItemGroup>
+</Project>`;
+
+    await fs.writeFile(filtersPath.fsPath, basicFiltersXml, 'utf-8');
+  }
+
+     /**
+    * Add all unfiltered files to the root node
+    */
+   private async addUnfilteredFilesToRoot(folderUri: vscode.Uri, root: FolderNode, filteredFiles: Set<string>): Promise<void> {
+     try {
+       // Get configured exclude patterns
+       const config = vscode.workspace.getConfiguration('vsFilters');
+       const excludePatterns = config.get<string[]>('excludePatterns', [
+         'node_modules/**',
+         'bin/**',
+         'obj/**',
+         'build/**',
+         'out/**',
+         'tmp/**',
+         '.vs/**',
+         '.git/**',
+         'dist/**'
+       ]);
+       
+       // Convert patterns to a single exclude pattern for VS Code's findFiles
+       // Use braces to combine multiple exclude patterns
+       const excludePattern = excludePatterns.length > 0 ? `{${excludePatterns.join(',')}}` : undefined;
+       
+       // Get configured file limit
+       const maxFiles = config.get<number>('maxFiles', 25000);
+       
+       // Find all files in the workspace, excluding configured directories
+       const allFiles = await vscode.workspace.findFiles(
+         new vscode.RelativePattern(folderUri, '**/*'),
+         excludePattern,
+         maxFiles // Configurable limit to prevent performance issues
+       );
+
+       for (const fileUri of allFiles) {
+         // Get relative path from workspace root
+         const relativePath = path.relative(folderUri.fsPath, fileUri.fsPath).replace(/\\/g, '/');
+         
+         // Skip directories and files that are already filtered
+         if (!filteredFiles.has(relativePath)) {
+           try {
+             // Check if it's actually a file (not a directory)
+             const stat = await vscode.workspace.fs.stat(fileUri);
+             if (stat.type === vscode.FileType.File) {
+               // Add unfiltered file to root
+               root.children.push(new FileNode(fileUri));
+             }
+           } catch (error) {
+             // Skip files that can't be accessed
+             continue;
+           }
+         }
+       }
+     } catch (error) {
+       // If file scanning fails, just continue without unfiltered files
+       console.warn('Failed to scan for unfiltered files:', error);
+     }
+   }
+
+   /**
+    * Check if a file should be excluded from watching/display
+    */
+   private shouldExcludeFile(relativePath: string): boolean {
+     // Get configured exclude patterns
+     const config = vscode.workspace.getConfiguration('vsFilters');
+     const excludePatterns = config.get<string[]>('excludePatterns', [
+       'node_modules/**',
+       'bin/**',
+       'obj/**',
+       'build/**',
+       'out/**',
+       'tmp/**',
+       '.vs/**',
+       '.git/**',
+       'dist/**'
+     ]);
+     
+     // Convert glob patterns to simple path matching
+     const simplePatterns = excludePatterns.map(pattern => 
+       pattern.replace(/\/?\*\*\/?/g, '') // Remove /** and **/ parts for simple matching
+     );
+     
+     return simplePatterns.some(pattern => 
+       relativePath.includes(pattern) || 
+       relativePath.startsWith(pattern) ||
+       relativePath.startsWith(pattern + '/')
+     );
+   }
 }
 
 /** Base abstract type for our tree items */
@@ -248,20 +961,36 @@ class FolderNode extends TreeItem {
   populated = false;
   children: TreeItem[] = [];
 
-  constructor(public readonly uri: vscode.Uri, label: string) {
+  constructor(public readonly uri: vscode.Uri, label: string, public readonly isWorkspaceRoot: boolean = false) {
     super(label, vscode.TreeItemCollapsibleState.Collapsed);
-    this.contextValue = 'folder';
+    this.contextValue = isWorkspaceRoot ? 'workspaceRoot' : 'folder';
   }
 }
 
 /**
  * Try to locate **the first** .vcxproj.filters file under the given workspace folder.
- * Adjust the glob-exclude patterns as needed.
+ * Uses configurable exclude patterns.
  */
 async function findFiltersFile(folder: vscode.Uri): Promise<vscode.Uri | undefined> {
+  // Get configured exclude patterns
+  const config = vscode.workspace.getConfiguration('vsFilters');
+  const excludePatterns = config.get<string[]>('excludePatterns', [
+    'node_modules/**',
+    'bin/**', 
+    'obj/**',
+    'build/**',
+    'out/**',
+    'tmp/**',
+    '.vs/**',
+    '.git/**',
+    'dist/**'
+  ]);
+  
+  const excludePattern = excludePatterns.length > 0 ? `{${excludePatterns.join(',')}}` : undefined;
+  
   const candidates = await vscode.workspace.findFiles(
     new vscode.RelativePattern(folder, '**/*.vcxproj.filters'),
-    '**/{bin,obj,build,out,tmp}/**',
+    excludePattern,
     1
   );
   return candidates.length > 0 ? candidates[0] : undefined;

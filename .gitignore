@@ -7,9 +7,13 @@ yarn-error.log*
 # Build output
 dist/
 out/
+*.tsbuildinfo
 
 # VS Code extension packaging
 *.vsix
+
+# Visual Studio files
+*.vcxproj.filters
 
 # OS generated files
 .DS_Store

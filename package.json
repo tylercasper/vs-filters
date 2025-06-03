@@ -2,7 +2,7 @@
     "name": "vs-filters",
     "displayName": "VS Filters",
     "description": "Filters files into virtual folders using Visual Studio '.filters' files.",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "publisher": "tyler-casper",
     "license": "GPL-3.0-or-later",
     "repository": {
@@ -33,9 +33,71 @@
       "commands": [
         {
           "command": "vsFilters.refresh",
-          "title": "Refresh VS Filters"
+          "title": "Refresh VS Filters",
+          "icon": "$(refresh)"
+        },
+        {
+          "command": "vsFilters.createFilter",
+          "title": "Create Filter",
+          "icon": "$(new-folder)"
+        },
+        {
+          "command": "vsFilters.deleteFilter",
+          "title": "Delete Filter",
+          "icon": "$(trash)"
         }
-      ]
+      ],
+              "menus": {
+          "view/title": [
+            {
+              "command": "vsFilters.refresh",
+              "when": "view == vsFilters",
+              "group": "navigation"
+            }
+          ],
+          "view/item/context": [
+            {
+              "command": "vsFilters.createFilter",
+              "when": "view == vsFilters && (viewItem == folder || viewItem == workspaceRoot)",
+              "group": "navigation"
+            },
+            {
+              "command": "vsFilters.deleteFilter",
+              "when": "view == vsFilters && viewItem == folder",
+              "group": "navigation"
+            }
+          ]
+        },
+        "configuration": {
+          "title": "VS Filters",
+          "properties": {
+            "vsFilters.excludePatterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": [
+                "node_modules/**",
+                "bin/**",
+                "obj/**", 
+                "build/**",
+                "out/**",
+                "tmp/**",
+                ".vs/**",
+                ".git/**",
+                "dist/**"
+              ],
+              "description": "Glob patterns for files and directories to exclude from the VS Filters view."
+            },
+            "vsFilters.maxFiles": {
+              "type": "number",
+              "default": 25000,
+              "minimum": 100,
+              "maximum": 500000,
+              "description": "Maximum number of files to scan when searching for unfiltered files. Higher values may impact performance on very large projects."
+            }
+          }
+        }
     },
     "scripts": {
       "vscode:prepublish": "npm run compile",
