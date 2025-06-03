@@ -2,7 +2,7 @@
     "name": "vs-filters",
     "displayName": "VS Filters",
     "description": "Filters files into virtual folders using Visual Studio '.filters' files.",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "publisher": "tyler-casper",
     "license": "GPL-3.0-or-later",
     "repository": {
@@ -26,7 +26,8 @@
         "explorer": [
           {
             "id": "vsFilters",
-            "name": "VS Filters"
+            "name": "VS Filters",
+            "when": "workspaceFolderCount != 0"
           }
         ]
       },
@@ -45,6 +46,54 @@
           "command": "vsFilters.deleteFilter",
           "title": "Delete Filter",
           "icon": "$(trash)"
+        },
+        {
+          "command": "vsFilters.openToSide",
+          "title": "Open to the Side"
+        },
+        {
+          "command": "vsFilters.revealInExplorer",
+          "title": "Reveal in File Explorer"
+        },
+        {
+          "command": "vsFilters.copyPath",
+          "title": "Copy Path"
+        },
+        {
+          "command": "vsFilters.copyRelativePath",
+          "title": "Copy Relative Path"
+        },
+        {
+          "command": "vsFilters.deleteFile",
+          "title": "Delete"
+        },
+        {
+          "command": "vsFilters.renameFile",
+          "title": "Rename..."
+        },
+        {
+          "command": "vsFilters.openWith",
+          "title": "Open With..."
+        },
+        {
+          "command": "vsFilters.openInTerminal",
+          "title": "Open in Integrated Terminal"
+        },
+        {
+          "command": "vsFilters.cut",
+          "title": "Cut"
+        },
+        {
+          "command": "vsFilters.copy",
+          "title": "Copy"
+        },
+        {
+          "command": "vsFilters.paste",
+          "title": "Paste"
+        },
+        {
+          "command": "vsFilters.focus",
+          "title": "Focus VS Filters Tree"
         }
       ],
               "menus": {
@@ -65,9 +114,130 @@
               "command": "vsFilters.deleteFilter",
               "when": "view == vsFilters && viewItem == folder",
               "group": "navigation"
+            },
+            {
+              "command": "vsFilters.paste",
+              "when": "view == vsFilters && (viewItem == folder || viewItem == workspaceRoot)",
+              "group": "5_cutcopypaste",
+              "enablement": "vsFilters.canPaste"
+            },
+            {
+              "command": "vsFilters.openToSide",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "1_open"
+            },
+            {
+              "command": "vsFilters.openWith",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "1_open"
+            },
+            {
+              "command": "vsFilters.revealInExplorer",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "1_open"
+            },
+            {
+              "command": "vsFilters.openInTerminal",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "1_open"
+            },
+            {
+              "command": "workbench.files.action.showActiveFileInExplorer",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "1_open"
+            },
+            {
+              "command": "workbench.action.files.share",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "2_share"
+            },
+            {
+              "command": "workbench.files.action.selectForCompare",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "3_compare"
+            },
+            {
+              "command": "workbench.files.action.compareFileWith",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "3_compare"
+            },
+            {
+              "command": "timeline.focus",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "4_search"
+            },
+            {
+              "command": "vsFilters.cut",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "5_cutcopypaste",
+              "enablement": "vsFilters.canCutFile"
+            },
+            {
+              "command": "vsFilters.copy",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "5_cutcopypaste",
+              "enablement": "vsFilters.canCopyFile"
+            },
+            {
+              "command": "vsFilters.paste",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "5_cutcopypaste",
+              "enablement": "vsFilters.canPaste"
+            },
+            {
+              "command": "vsFilters.copyPath",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "6_copypath"
+            },
+            {
+              "command": "vsFilters.copyRelativePath",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "6_copypath"
+            },
+            {
+              "command": "vsFilters.renameFile",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "7_modification",
+              "enablement": "vsFilters.canRenameFile"
+            },
+            {
+              "command": "vsFilters.deleteFile",
+              "when": "view == vsFilters && viewItem == file",
+              "group": "7_modification",
+              "enablement": "vsFilters.canDeleteFile"
             }
           ]
         },
+        "keybindings": [
+          {
+            "command": "vsFilters.copy",
+            "key": "ctrl+c",
+            "mac": "cmd+c",
+            "when": "focusedView == vsFilters && listFocus && vsFilters.canCopyFile"
+          },
+          {
+            "command": "vsFilters.cut", 
+            "key": "ctrl+x",
+            "mac": "cmd+x",
+            "when": "focusedView == vsFilters && listFocus && vsFilters.canCutFile"
+          },
+          {
+            "command": "vsFilters.paste",
+            "key": "ctrl+v", 
+            "mac": "cmd+v",
+            "when": "focusedView == vsFilters && listFocus && vsFilters.canPaste"
+          },
+          {
+            "command": "vsFilters.deleteFile",
+            "key": "delete",
+            "when": "focusedView == vsFilters && listFocus && vsFilters.canDeleteFile"
+          },
+          {
+            "command": "vsFilters.renameFile",
+            "key": "f2",
+            "when": "focusedView == vsFilters && listFocus && vsFilters.canRenameFile"
+          }
+        ],
         "configuration": {
           "title": "VS Filters",
           "properties": {
