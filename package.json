@@ -2,7 +2,7 @@
     "name": "vs-filters",
     "displayName": "VS Filters",
     "description": "Filters files into virtual folders using Visual Studio '.filters' files.",
-    "version": "0.0.3",
+    "version": "0.1.0",
     "publisher": "tyler-casper",
     "license": "GPL-3.0-or-later",
     "repository": {
@@ -17,8 +17,7 @@
       "Other"
     ],
     "activationEvents": [
-      "workspaceContains:**/*.vcxproj.filters",
-      "onView:vsFilters"
+      "workspaceContains:**/*.vcxproj.filters"
     ],
     "main": "./dist/extension.js",
     "contributes": {
@@ -27,7 +26,8 @@
           {
             "id": "vsFilters",
             "name": "VS Filters",
-            "when": "workspaceFolderCount != 0"
+            "when": "workspaceFolderCount != 0",
+            "icon": "$(folder-library)"
           }
         ]
       },
@@ -107,7 +107,7 @@
           "view/item/context": [
             {
               "command": "vsFilters.createFilter",
-              "when": "view == vsFilters && (viewItem == folder || viewItem == workspaceRoot)",
+              "when": "view == vsFilters && (viewItem == folder || viewItem == project)",
               "group": "navigation"
             },
             {
@@ -117,7 +117,7 @@
             },
             {
               "command": "vsFilters.paste",
-              "when": "view == vsFilters && (viewItem == folder || viewItem == workspaceRoot)",
+              "when": "view == vsFilters && (viewItem == folder || viewItem == project || viewItem == unfilteredFolder)",
               "group": "5_cutcopypaste",
               "enablement": "vsFilters.canPaste"
             },
@@ -147,24 +147,9 @@
               "group": "1_open"
             },
             {
-              "command": "workbench.action.files.share",
-              "when": "view == vsFilters && viewItem == file",
-              "group": "2_share"
-            },
-            {
-              "command": "workbench.files.action.selectForCompare",
-              "when": "view == vsFilters && viewItem == file",
-              "group": "3_compare"
-            },
-            {
               "command": "workbench.files.action.compareFileWith",
               "when": "view == vsFilters && viewItem == file",
               "group": "3_compare"
-            },
-            {
-              "command": "timeline.focus",
-              "when": "view == vsFilters && viewItem == file",
-              "group": "4_search"
             },
             {
               "command": "vsFilters.cut",

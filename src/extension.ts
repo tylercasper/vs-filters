@@ -293,9 +293,12 @@ export function activate(context: vscode.ExtensionContext) {
         let targetFilter: string | undefined;
         
         // Determine target filter based on current selection
-        if (node?.contextValue === 'folder' && !node?.isWorkspaceRoot) {
+        if (node?.contextValue === 'folder') {
           // Pasting into a specific filter folder
           targetFilter = await provider.getFilterPathFromNode(node);
+        } else if (node?.contextValue === 'unfilteredFolder') {
+          // Pasting into unfiltered folder - explicitly remove filter
+          targetFilter = '';
         } else if (node?.contextValue === 'file') {
           // Pasting next to a file - use that file's filter
           targetFilter = await provider.getFileFilter(targetUri);
